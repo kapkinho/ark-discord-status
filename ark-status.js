@@ -26,7 +26,6 @@ function fmtNumber(value, digits = 1) {
   if (value == null || value === "") return null;
 
   const n = Number(value);
-
   if (!Number.isFinite(n)) return null;
 
   return new Intl.NumberFormat("pt-BR", {
@@ -53,14 +52,59 @@ function discordTimestamp(dateString) {
   if (!dateString) return "Indisponível";
 
   const ms = Date.parse(dateString);
-
   if (!Number.isFinite(ms)) {
     return String(dateString);
   }
 
   const unix = Math.floor(ms / 1000);
-
   return `<t:${unix}:R>`;
+}
+
+function normalizeMap(map) {
+  if (!map) return null;
+
+  const aliases = {
+    Astraeos_WP: "Astraeos"
+  };
+
+  return aliases[map] ?? String(map).replace(/_WP$/i, "");
+}
+
+function normalizePlatform(platform) {
+  if (!platform) return null;
+
+  let raw;
+
+  if (Array.isArray(platform)) {
+    raw = platform.join("+");
+  } else if (typeof platform === "object") {
+    raw = Object.values(platform).filter(Boolean).join("+");
+  } else {
+    raw = String(platform);
+  }
+
+  const parts = raw
+    .split(/[+,/|]/)
+    .map(p => p.trim())
+    .filter(Boolean);
+
+  const aliases = {
+    PC: "PC",
+    WIN: "Windows",
+    WINGDK: "Windows",
+    XSX: "Xbox Series",
+    XBOX: "Xbox",
+    XB: "Xbox",
+    PS5: "PS5",
+    PS: "PlayStation"
+  };
+
+  const normalized = parts.map(part => {
+    const key = part.toUpperCase();
+    return aliases[key] ?? part;
+  });
+
+  return [...new Set(normalized)].join(" / ");
 }
 
 async function getExistingMessage(messageId) {
@@ -116,12 +160,6 @@ async function fetchServerData() {
   }
 
   const json = await response.json();
-
-  /*
-   * Algumas APIs retornam o servidor diretamente;
-   * outras embrulham em "data".
-   * Aceitamos ambos.
-   */
   const s = json.data ?? json;
 
   const stats7 =
@@ -173,12 +211,7 @@ async function fetchServerData() {
   }
 
   return {
-    raw: s,
-
-    name:
-      s.name ??
-      SERVER.name,
-
+    name: s.name ?? SERVER.name,
     status,
 
     players:
@@ -193,9 +226,11 @@ async function fetchServerData() {
         : Number(playerPercentage),
 
     map:
-      s.map ??
-      s.map_name ??
-      null,
+      normalizeMap(
+        s.map ??
+        s.map_name ??
+        null
+      ),
 
     ping:
       s.ping == null
@@ -203,8 +238,7 @@ async function fetchServerData() {
         : Number(s.ping),
 
     version:
-      s.version ??
-      null,
+      s.version ?? null,
 
     day:
       s.day_number ??
@@ -217,17 +251,17 @@ async function fetchServerData() {
       null,
 
     platform:
-      s.platform ??
-      s.platforms ??
-      null,
+      normalizePlatform(
+        s.platform ??
+        s.platforms ??
+        null
+      ),
 
     isOfficial:
-      s.is_official ??
-      null,
+      s.is_official ?? null,
 
     hasPassword:
-      s.has_password ??
-      null,
+      s.has_password ?? null,
 
     lastUpdated:
       s.last_updated ??
@@ -264,25 +298,6 @@ async function fetchServerData() {
       stats30.max_players ??
       null
   };
-}
-
-function normalizePlatform(platform) {
-  if (!platform) return "Indisponível";
-
-  if (Array.isArray(platform)) {
-    return platform.join(" / ");
-  }
-
-  if (typeof platform === "object") {
-    return Object.values(platform)
-      .filter(Boolean)
-      .join(" / ");
-  }
-
-  return String(platform)
-    .replace(/\bWin\b/gi, "Windows")
-    .replace(/\bPS\b/gi, "PlayStation")
-    .replace(/\bXB\b/gi, "Xbox");
 }
 
 function buildPayload(data, existingMessage) {
@@ -334,10 +349,10 @@ function buildPayload(data, existingMessage) {
       ? `${pingIcon(data.ping)} **${data.ping} ms**`
       : "⚪ Indisponível";
 
-  const mapLine = [
+  const headerBits = [
     data.map ? `🗺️ **${data.map}**` : null,
     data.gameMode ? `🛡️ **${data.gameMode}**` : null,
-    data.version ? `🎮 **v${data.version}**` : null
+    data.version ? `🧩 **v${data.version}**` : null
   ]
     .filter(Boolean)
     .join("  •  ");
@@ -357,78 +372,90 @@ function buildPayload(data, existingMessage) {
       name: "📶 Ping",
       value: pingText,
       inline: true
-    },
-    {
+    }
+  ];
+
+  if (data.day != null) {
+    fields.push({
       name: "🌍 Dia do mundo",
-      value:
-        data.day != null
-          ? `**${data.day}**`
-          : "Indisponível",
+      value: `**${data.day}**`,
       inline: true
-    },
-    {
+    });
+  }
+
+  if (data.uptime7 != null) {
+    fields.push({
       name: "📈 Uptime 7 dias",
-      value:
-        data.uptime7 != null
-          ? `**${fmtNumber(data.uptime7)}%**`
-          : "Indisponível",
+      value: `**${fmtNumber(data.uptime7)}%**`,
       inline: true
-    },
-    {
+    });
+  }
+
+  if (data.average7 != null || data.peak7 != null) {
+    fields.push({
       name: "📊 Média / Pico 7d",
       value:
-        data.average7 != null || data.peak7 != null
-          ? `Média: **${fmtNumber(data.average7)}**\nPico: **${fmtNumber(data.peak7, 0)}**`
-          : "Indisponível",
+        `Média: **${fmtNumber(data.average7) ?? "?"}**\n` +
+        `Pico: **${fmtNumber(data.peak7, 0) ?? "?"}**`,
       inline: true
-    },
-    {
+    });
+  }
+
+  if (data.uptime30 != null) {
+    fields.push({
       name: "📈 Uptime 30 dias",
-      value:
-        data.uptime30 != null
-          ? `**${fmtNumber(data.uptime30)}%**`
-          : "Indisponível",
+      value: `**${fmtNumber(data.uptime30)}%**`,
       inline: true
-    },
-    {
+    });
+  }
+
+  if (data.average30 != null || data.peak30 != null) {
+    fields.push({
       name: "📊 Média / Pico 30d",
       value:
-        data.average30 != null || data.peak30 != null
-          ? `Média: **${fmtNumber(data.average30)}**\nPico: **${fmtNumber(data.peak30, 0)}**`
-          : "Indisponível",
+        `Média: **${fmtNumber(data.average30) ?? "?"}**\n` +
+        `Pico: **${fmtNumber(data.peak30, 0) ?? "?"}**`,
       inline: true
-    },
-    {
+    });
+  }
+
+  if (data.platform) {
+    fields.push({
       name: "🖥️ Plataformas",
-      value: normalizePlatform(data.platform),
+      value: data.platform,
       inline: true
-    },
-    {
+    });
+  }
+
+  if (data.isOfficial != null) {
+    fields.push({
       name: "🏛️ Servidor",
       value:
         data.isOfficial === true
           ? "✅ **Oficial**"
-          : data.isOfficial === false
-          ? "🔧 **Não oficial**"
-          : "Indisponível",
+          : "🔧 **Não oficial**",
       inline: true
-    },
-    {
+    });
+  }
+
+  if (data.hasPassword != null) {
+    fields.push({
       name: "🔐 Senha",
       value:
         data.hasPassword === true
           ? "🔒 Sim"
-          : data.hasPassword === false
-          ? "🔓 Não"
-          : "Indisponível",
+          : "🔓 Não",
       inline: true
-    },
-    {
+    });
+  }
+
+  if (data.lastUpdated) {
+    fields.push({
       name: "🔄 Último dado do ARKStatus",
       value: discordTimestamp(data.lastUpdated),
       inline: false
-    }
-  ];
+    });
+  }
 
   return {
     username: "ARK Server Status",
@@ -437,7 +464,7 @@ function buildPayload(data, existingMessage) {
         title: `${statusEmoji} ${data.name}`,
         url: SERVER.details,
         description:
-          `${mapLine || "ARK: Survival Ascended"}\n\n` +
+          `${headerBits || "ARK: Survival Ascended"}\n\n` +
           `[🔗 Abrir servidor no ARKStatus](${SERVER.details})`,
         color,
         fields,
@@ -487,7 +514,6 @@ function buildErrorPayload(error, existingMessage) {
 
 async function sendNewMessage(payload) {
   const url = new URL(WEBHOOK);
-
   url.searchParams.set("wait", "true");
 
   const response = await fetch(url, {
@@ -564,12 +590,15 @@ async function main() {
           ping: data.ping,
           day: data.day,
           version: data.version,
+          platform: data.platform,
           uptime7: data.uptime7,
           average7: data.average7,
           peak7: data.peak7,
           uptime30: data.uptime30,
           average30: data.average30,
-          peak30: data.peak30
+          peak30: data.peak30,
+          isOfficial: data.isOfficial,
+          hasPassword: data.hasPassword
         },
         null,
         2
