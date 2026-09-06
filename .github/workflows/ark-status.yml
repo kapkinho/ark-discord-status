@@ -24,6 +24,7 @@ jobs:
       - name: Update Discord status
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          ARKSTATUS_API_KEY: ${{ secrets.ARKSTATUS_API_KEY }}
         run: node ark-status.js
 
       - name: Save Discord message ID
