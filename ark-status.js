@@ -1,11 +1,13 @@
 const fs = require("fs");
 
 const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
+const ARKSTATUS_API_KEY = process.env.ARKSTATUS_API_KEY;
 
 const SERVER = {
   name: "NA-PVE-Astraeos5962",
   id: "958296",
-  url: "https://arkstatus.com/server-details/na-pve-astraeos5962/958296?lang=en"
+  details: "https://arkstatus.com/server-details/na-pve-astraeos5962/958296",
+  api: "https://arkstatus.com/api/v1"
 };
 
 const MESSAGE_ID_FILE = ".ark-status-message-id";
@@ -14,45 +16,22 @@ if (!WEBHOOK) {
   throw new Error("DISCORD_WEBHOOK_URL não configurado.");
 }
 
+if (!ARKSTATUS_API_KEY) {
+  throw new Error("ARKSTATUS_API_KEY não configurado.");
+}
+
 const webhookBase = WEBHOOK.split("?")[0].replace(/\/$/, "");
 
-function decodeHtml(text) {
-  return text
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">");
-}
+function fmtNumber(value, digits = 1) {
+  if (value == null || value === "") return null;
 
-function htmlToText(html) {
-  return decodeHtml(
-    html
-      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
-      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
-      .replace(/<(br|\/p|\/div|\/section|\/li|\/h\d)>/gi, "\n")
-      .replace(/<[^>]+>/g, " ")
-  )
-    .replace(/[ \t]+/g, " ")
-    .replace(/\n\s+/g, "\n")
-    .replace(/\n{2,}/g, "\n")
-    .trim();
-}
+  const n = Number(value);
 
-function oneLine(text) {
-  return text.replace(/\s+/g, " ").trim();
-}
+  if (!Number.isFinite(n)) return null;
 
-function firstMatch(text, regex, group = 1) {
-  const match = text.match(regex);
-  return match ? match[group]?.trim() ?? null : null;
-}
-
-function numberValue(value) {
-  if (value == null) return null;
-  const n = Number(String(value).replace(",", "."));
-  return Number.isFinite(n) ? n : null;
+  return new Intl.NumberFormat("pt-BR", {
+    maximumFractionDigits: digits
+  }).format(n);
 }
 
 function pingIcon(ping) {
@@ -63,23 +42,25 @@ function pingIcon(ping) {
 }
 
 function occupancyIcon(percent) {
+  if (percent == null) return "⚪";
   if (percent >= 90) return "🔴";
   if (percent >= 70) return "🟠";
   if (percent >= 40) return "🟡";
   return "🟢";
 }
 
-function formatNowBR() {
-  return new Intl.DateTimeFormat("pt-BR", {
-    timeZone: "America/Sao_Paulo",
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false
-  }).format(new Date());
+function discordTimestamp(dateString) {
+  if (!dateString) return "Indisponível";
+
+  const ms = Date.parse(dateString);
+
+  if (!Number.isFinite(ms)) {
+    return String(dateString);
+  }
+
+  const unix = Math.floor(ms / 1000);
+
+  return `<t:${unix}:R>`;
 }
 
 async function getExistingMessage(messageId) {
@@ -103,172 +84,205 @@ function getField(embed, name) {
 }
 
 function previousPlayers(existingMessage) {
-  const embed = existingMessage?.embeds?.[0];
-  const value = getField(embed, "👥 Jogadores");
+  const value = getField(
+    existingMessage?.embeds?.[0],
+    "👥 Jogadores"
+  );
 
   if (!value) return null;
 
   const match = value.match(/(\d+)\s*\/\s*(\d+)/);
+
   return match ? Number(match[1]) : null;
 }
 
-function previousStatus(existingMessage) {
-  const embed = existingMessage?.embeds?.[0];
-  const value = getField(embed, "📡 Status");
-
-  if (!value) return null;
-
-  if (/ONLINE/i.test(value)) return "ONLINE";
-  if (/OFFLINE/i.test(value)) return "OFFLINE";
-
-  return null;
-}
-
-function previousStatusSince(existingMessage) {
-  const embed = existingMessage?.embeds?.[0];
-  return getField(embed, "⏱️ Status desde");
-}
-
 async function fetchServerData() {
-  const response = await fetch(`${SERVER.url}&t=${Date.now()}`, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 ARKDiscordStatus/1.0 (+GitHub Actions)"
-    },
-    cache: "no-store"
-  });
+  const response = await fetch(
+    `${SERVER.api}/servers/${SERVER.id}`,
+    {
+      headers: {
+        "X-API-Key": ARKSTATUS_API_KEY,
+        "Accept": "application/json"
+      }
+    }
+  );
 
   if (!response.ok) {
-    throw new Error(`ARKStatus respondeu HTTP ${response.status}`);
+    const body = await response.text();
+
+    throw new Error(
+      `ARKStatus API respondeu HTTP ${response.status}: ${body.slice(0, 500)}`
+    );
   }
 
-  const html = await response.text();
-  const text = htmlToText(html);
-  const flat = oneLine(text);
+  const json = await response.json();
 
   /*
-   * O resumo principal atualmente aparece no ARKStatus como:
-   *
-   * NA-PVE-Astraeos5962 - Online, Players 6/70,
-   * 188ms, Map Astraeos, Rank #3,050, 7d uptime 87.4%.
+   * Algumas APIs retornam o servidor diretamente;
+   * outras embrulham em "data".
+   * Aceitamos ambos.
    */
-  const summary = flat.match(
-    /NA-PVE-Astraeos5962\s*-\s*(Online|Offline).*?Players\s*(\d+)\s*\/\s*(\d+).*?(\d+)\s*ms.*?Map\s+(.+?)\s*,\s*Rank\s+#([\d,]+).*?7d uptime\s*([\d.]+)%/i
-  );
+  const s = json.data ?? json;
 
-  let status = null;
-  let players = null;
-  let maxPlayers = null;
-  let ping = null;
-  let map = null;
-  let rank = null;
-  let uptime7d = null;
+  const stats7 =
+    s.statistics?.["7_days"] ??
+    s.statistics?.seven_days ??
+    s.statistics?.days_7 ??
+    {};
 
-  if (summary) {
-    status = summary[1].toUpperCase();
-    players = Number(summary[2]);
-    maxPlayers = Number(summary[3]);
-    ping = Number(summary[4]);
-    map = summary[5].trim();
-    rank = `#${summary[6]}`;
-    uptime7d = numberValue(summary[7]);
-  }
+  const stats30 =
+    s.statistics?.["30_days"] ??
+    s.statistics?.thirty_days ??
+    s.statistics?.days_30 ??
+    {};
 
-  // Fallbacks, caso o resumo da página mude levemente.
-  if (!status) {
-    status =
-      /\bOnline\b/i.test(flat)
-        ? "ONLINE"
-        : /\bOffline\b/i.test(flat)
-        ? "OFFLINE"
-        : "DESCONHECIDO";
-  }
+  const statusRaw =
+    s.status ??
+    s.server_status ??
+    "unknown";
 
-  if (players == null || maxPlayers == null) {
-    const p = flat.match(
-      /Survivors online\s*(\d+)\s*\/\s*(\d+)/i
-    );
+  const status =
+    String(statusRaw).toLowerCase() === "online"
+      ? "ONLINE"
+      : String(statusRaw).toLowerCase() === "offline"
+      ? "OFFLINE"
+      : "DESCONHECIDO";
 
-    if (p) {
-      players = Number(p[1]);
-      maxPlayers = Number(p[2]);
-    }
-  }
+  const players =
+    s.players ??
+    s.current_players ??
+    null;
 
-  if (ping == null) {
-    const p = flat.match(/Latency\s*(\d+)\s*ms/i);
-    if (p) ping = Number(p[1]);
-  }
+  const maxPlayers =
+    s.max_players ??
+    s.maxPlayers ??
+    null;
 
-  if (uptime7d == null) {
-    uptime7d = numberValue(
-      firstMatch(flat, /7-day uptime\s*([\d.]+)%/i)
-    );
-  }
+  let playerPercentage =
+    s.player_percentage ??
+    s.playerPercentage ??
+    null;
 
-  const avgPlayers = numberValue(
-    firstMatch(flat, /Avg players \(7d\)\s*([\d.]+)/i)
-  );
-
-  const peakPlayers = numberValue(
-    firstMatch(flat, /Peak players \(7d\)\s*(\d+)/i)
-  );
-
-  const currentUptime =
-    firstMatch(
-      flat,
-      /Current uptime\s*(.+?)\s*Average session/i
-    )?.replace(/\*/g, "") ?? null;
-
-  const day = firstMatch(
-    flat,
-    /(?:Online|Offline)\s+Last updated.+?\s+Day\s+(\d+)/i
-  );
-
-  const version = firstMatch(
-    flat,
-    /Day\s+\d+\s+v([\d.]+)/i
-  );
-
-  const lastUpdated = firstMatch(
-    flat,
-    /(?:Online|Offline)\s+Last updated\s+(.+?)\s+Day\s+\d+/i
-  );
-
-  const mode =
-    firstMatch(flat, /Game Mode\s+(PvE|PvP)\s+server/i) ?? null;
-
-  let platform =
-    firstMatch(
-      flat,
-      /Platform\s+(.+?)\s+Transfers/i
-    ) ?? null;
-
-  if (platform) {
-    platform = platform
-      .replace(/\bWin\b/g, "Windows")
-      .replace(/\bPS\b/g, "PlayStation")
-      .replace(/\bXB\b/g, "Xbox")
-      .replace(/\s+/g, " / ");
+  if (
+    playerPercentage == null &&
+    players != null &&
+    maxPlayers
+  ) {
+    playerPercentage =
+      (Number(players) / Number(maxPlayers)) * 100;
   }
 
   return {
+    raw: s,
+
+    name:
+      s.name ??
+      SERVER.name,
+
     status,
-    players,
-    maxPlayers,
-    ping,
-    map,
-    rank,
-    uptime7d,
-    avgPlayers,
-    peakPlayers,
-    currentUptime,
-    day,
-    version,
-    lastUpdated,
-    mode,
-    platform
+
+    players:
+      players == null ? null : Number(players),
+
+    maxPlayers:
+      maxPlayers == null ? null : Number(maxPlayers),
+
+    playerPercentage:
+      playerPercentage == null
+        ? null
+        : Number(playerPercentage),
+
+    map:
+      s.map ??
+      s.map_name ??
+      null,
+
+    ping:
+      s.ping == null
+        ? null
+        : Number(s.ping),
+
+    version:
+      s.version ??
+      null,
+
+    day:
+      s.day_number ??
+      s.day ??
+      null,
+
+    gameMode:
+      s.game_mode ??
+      s.mode ??
+      null,
+
+    platform:
+      s.platform ??
+      s.platforms ??
+      null,
+
+    isOfficial:
+      s.is_official ??
+      null,
+
+    hasPassword:
+      s.has_password ??
+      null,
+
+    lastUpdated:
+      s.last_updated ??
+      s.last_snapshot ??
+      null,
+
+    uptime7:
+      stats7.uptime_percentage ??
+      stats7.uptime ??
+      null,
+
+    average7:
+      stats7.average_players ??
+      stats7.avg_players ??
+      null,
+
+    peak7:
+      stats7.peak_players ??
+      stats7.max_players ??
+      null,
+
+    uptime30:
+      stats30.uptime_percentage ??
+      stats30.uptime ??
+      null,
+
+    average30:
+      stats30.average_players ??
+      stats30.avg_players ??
+      null,
+
+    peak30:
+      stats30.peak_players ??
+      stats30.max_players ??
+      null
   };
+}
+
+function normalizePlatform(platform) {
+  if (!platform) return "Indisponível";
+
+  if (Array.isArray(platform)) {
+    return platform.join(" / ");
+  }
+
+  if (typeof platform === "object") {
+    return Object.values(platform)
+      .filter(Boolean)
+      .join(" / ");
+  }
+
+  return String(platform)
+    .replace(/\bWin\b/gi, "Windows")
+    .replace(/\bPS\b/gi, "PlayStation")
+    .replace(/\bXB\b/gi, "Xbox");
 }
 
 function buildPayload(data, existingMessage) {
@@ -286,14 +300,9 @@ function buildPayload(data, existingMessage) {
     color = 0xe74c3c;
   }
 
-  const occupancy =
-    data.players != null && data.maxPlayers
-      ? Math.round((data.players / data.maxPlayers) * 100)
-      : null;
-
   const prevPlayers = previousPlayers(existingMessage);
 
-  let playerDelta = "";
+  let deltaText = "";
 
   if (
     prevPlayers != null &&
@@ -302,23 +311,22 @@ function buildPayload(data, existingMessage) {
   ) {
     const delta = data.players - prevPlayers;
 
-    playerDelta =
+    deltaText =
       delta > 0
         ? ` · ▲ +${delta}`
         : ` · ▼ ${delta}`;
   }
 
-  const oldStatus = previousStatus(existingMessage);
-  const oldSince = previousStatusSince(existingMessage);
+  const occupancy =
+    data.playerPercentage != null
+      ? Math.round(data.playerPercentage)
+      : null;
 
-  const statusSince =
-    oldStatus === data.status && oldSince
-      ? oldSince
-      : formatNowBR();
-
-  const playersText =
+  const playerText =
     data.players != null && data.maxPlayers != null
-      ? `${occupancyIcon(occupancy)} **${data.players} / ${data.maxPlayers}** · ${occupancy}%${playerDelta}`
+      ? `${occupancyIcon(occupancy)} **${data.players} / ${data.maxPlayers}**` +
+        (occupancy != null ? ` · ${occupancy}%` : "") +
+        deltaText
       : "⚪ Indisponível";
 
   const pingText =
@@ -326,9 +334,9 @@ function buildPayload(data, existingMessage) {
       ? `${pingIcon(data.ping)} **${data.ping} ms**`
       : "⚪ Indisponível";
 
-  const infoLine = [
+  const mapLine = [
     data.map ? `🗺️ **${data.map}**` : null,
-    data.mode ? `🛡️ **${data.mode}**` : null,
+    data.gameMode ? `🛡️ **${data.gameMode}**` : null,
     data.version ? `🎮 **v${data.version}**` : null
   ]
     .filter(Boolean)
@@ -342,7 +350,7 @@ function buildPayload(data, existingMessage) {
     },
     {
       name: "👥 Jogadores",
-      value: playersText,
+      value: playerText,
       inline: true
     },
     {
@@ -351,109 +359,127 @@ function buildPayload(data, existingMessage) {
       inline: true
     },
     {
-      name: "⏱️ Status desde",
-      value: statusSince,
-      inline: true
-    },
-    {
-      name: "🕒 Uptime atual",
-      value: data.currentUptime
-        ? `**${data.currentUptime}**`
-        : "Indisponível",
+      name: "🌍 Dia do mundo",
+      value:
+        data.day != null
+          ? `**${data.day}**`
+          : "Indisponível",
       inline: true
     },
     {
       name: "📈 Uptime 7 dias",
       value:
-        data.uptime7d != null
-          ? `**${data.uptime7d}%**`
+        data.uptime7 != null
+          ? `**${fmtNumber(data.uptime7)}%**`
           : "Indisponível",
       inline: true
     },
     {
-      name: "📊 Média / Pico (7d)",
+      name: "📊 Média / Pico 7d",
       value:
-        data.avgPlayers != null || data.peakPlayers != null
-          ? `Média: **${data.avgPlayers ?? "?"}**\nPico: **${data.peakPlayers ?? "?"}**`
+        data.average7 != null || data.peak7 != null
+          ? `Média: **${fmtNumber(data.average7)}**\nPico: **${fmtNumber(data.peak7, 0)}**`
           : "Indisponível",
       inline: true
     },
     {
-      name: "🌍 Dia do mundo",
-      value: data.day ? `**${data.day}**` : "Indisponível",
+      name: "📈 Uptime 30 dias",
+      value:
+        data.uptime30 != null
+          ? `**${fmtNumber(data.uptime30)}%**`
+          : "Indisponível",
       inline: true
     },
     {
-      name: "🏆 Ranking global",
-      value: data.rank ? `**${data.rank}**` : "Indisponível",
+      name: "📊 Média / Pico 30d",
+      value:
+        data.average30 != null || data.peak30 != null
+          ? `Média: **${fmtNumber(data.average30)}**\nPico: **${fmtNumber(data.peak30, 0)}**`
+          : "Indisponível",
       inline: true
+    },
+    {
+      name: "🖥️ Plataformas",
+      value: normalizePlatform(data.platform),
+      inline: true
+    },
+    {
+      name: "🏛️ Servidor",
+      value:
+        data.isOfficial === true
+          ? "✅ **Oficial**"
+          : data.isOfficial === false
+          ? "🔧 **Não oficial**"
+          : "Indisponível",
+      inline: true
+    },
+    {
+      name: "🔐 Senha",
+      value:
+        data.hasPassword === true
+          ? "🔒 Sim"
+          : data.hasPassword === false
+          ? "🔓 Não"
+          : "Indisponível",
+      inline: true
+    },
+    {
+      name: "🔄 Último dado do ARKStatus",
+      value: discordTimestamp(data.lastUpdated),
+      inline: false
     }
   ];
-
-  if (data.platform) {
-    fields.push({
-      name: "🖥️ Plataformas",
-      value: data.platform,
-      inline: false
-    });
-  }
-
-  fields.push({
-    name: "🔄 Fonte",
-    value: data.lastUpdated
-      ? `ARKStatus atualizado **${data.lastUpdated}**`
-      : "ARKStatus consultado com sucesso",
-    inline: false
-  });
 
   return {
     username: "ARK Server Status",
     embeds: [
       {
-        title: `${statusEmoji} ${SERVER.name}`,
-        url: SERVER.url,
+        title: `${statusEmoji} ${data.name}`,
+        url: SERVER.details,
         description:
-          `${infoLine}\n\n` +
-          `[🔗 Abrir página completa no ARKStatus](${SERVER.url})`,
+          `${mapLine || "ARK: Survival Ascended"}\n\n` +
+          `[🔗 Abrir servidor no ARKStatus](${SERVER.details})`,
         color,
         fields,
         footer: {
-          text: `Consulta automática • ${formatNowBR()} • America/Sao_Paulo`
-        }
+          text: "ARKStatus API • atualização automática a cada 5 minutos"
+        },
+        timestamp: new Date().toISOString()
       }
     ]
   };
 }
 
 function buildErrorPayload(error, existingMessage) {
-  const previousEmbed = existingMessage?.embeds?.[0];
+  const oldEmbed = existingMessage?.embeds?.[0];
 
   return {
     username: "ARK Server Status",
     embeds: [
       {
         title: `🟡 ${SERVER.name}`,
-        url: SERVER.url,
+        url: SERVER.details,
         description:
-          "⚠️ **Não foi possível atualizar os dados agora.**\n\n" +
-          "Isso **não significa que o servidor ARK esteja offline**. " +
-          "A consulta ao ARKStatus falhou ou retornou um formato inesperado.",
+          "⚠️ **Não foi possível consultar o ARKStatus agora.**\n\n" +
+          "Isso não significa que o servidor ARK esteja offline.",
         color: 0xf1c40f,
         fields: [
           {
             name: "Último status conhecido",
             value:
-              getField(previousEmbed, "📡 Status") ??
+              getField(oldEmbed, "📡 Status") ??
               "Ainda não há status anterior."
           },
           {
-            name: "Erro da consulta",
-            value: `\`${String(error.message).slice(0, 900)}\``
+            name: "Erro da API",
+            value:
+              `\`${String(error.message).slice(0, 900)}\``
           }
         ],
         footer: {
-          text: `Nova tentativa automática • ${formatNowBR()}`
-        }
+          text: "Nova tentativa automática em até 5 minutos"
+        },
+        timestamp: new Date().toISOString()
       }
     ]
   };
@@ -461,6 +487,7 @@ function buildErrorPayload(error, existingMessage) {
 
 async function sendNewMessage(payload) {
   const url = new URL(WEBHOOK);
+
   url.searchParams.set("wait", "true");
 
   const response = await fetch(url, {
@@ -509,13 +536,16 @@ async function main() {
   let messageId = null;
 
   if (fs.existsSync(MESSAGE_ID_FILE)) {
-    messageId = fs.readFileSync(MESSAGE_ID_FILE, "utf8").trim();
+    messageId = fs
+      .readFileSync(MESSAGE_ID_FILE, "utf8")
+      .trim();
   }
 
   let existingMessage = null;
 
   if (messageId) {
-    existingMessage = await getExistingMessage(messageId);
+    existingMessage =
+      await getExistingMessage(messageId);
   }
 
   let payload;
@@ -523,25 +553,51 @@ async function main() {
   try {
     const data = await fetchServerData();
 
-    console.log("Dados ARKStatus:", data);
+    console.log("ARKStatus API OK");
+    console.log(
+      JSON.stringify(
+        {
+          status: data.status,
+          players: data.players,
+          maxPlayers: data.maxPlayers,
+          map: data.map,
+          ping: data.ping,
+          day: data.day,
+          version: data.version,
+          uptime7: data.uptime7,
+          average7: data.average7,
+          peak7: data.peak7,
+          uptime30: data.uptime30,
+          average30: data.average30,
+          peak30: data.peak30
+        },
+        null,
+        2
+      )
+    );
 
     payload = buildPayload(data, existingMessage);
   } catch (error) {
-    console.error("Falha ARKStatus:", error);
+    console.error("Falha ARKStatus API:", error);
 
-    payload = buildErrorPayload(error, existingMessage);
+    payload =
+      buildErrorPayload(error, existingMessage);
   }
 
   if (messageId && existingMessage) {
-    const updated = await editMessage(messageId, payload);
+    const updated =
+      await editMessage(messageId, payload);
 
     if (updated) {
-      console.log(`Mensagem atualizada: ${messageId}`);
+      console.log(
+        `Mensagem atualizada: ${messageId}`
+      );
       return;
     }
   }
 
-  const created = await sendNewMessage(payload);
+  const created =
+    await sendNewMessage(payload);
 
   fs.writeFileSync(
     MESSAGE_ID_FILE,
@@ -549,7 +605,9 @@ async function main() {
     "utf8"
   );
 
-  console.log(`Nova mensagem criada: ${created.id}`);
+  console.log(
+    `Nova mensagem criada: ${created.id}`
+  );
 }
 
 main().catch(error => {
