@@ -52,11 +52,13 @@ function discordTimestamp(dateString) {
   if (!dateString) return "Indisponível";
 
   const ms = Date.parse(dateString);
+
   if (!Number.isFinite(ms)) {
     return String(dateString);
   }
 
   const unix = Math.floor(ms / 1000);
+
   return `<t:${unix}:R>`;
 }
 
@@ -101,6 +103,7 @@ function normalizePlatform(platform) {
 
   const normalized = parts.map(part => {
     const key = part.toUpperCase();
+
     return aliases[key] ?? part;
   });
 
@@ -110,7 +113,9 @@ function normalizePlatform(platform) {
 async function getExistingMessage(messageId) {
   if (!messageId) return null;
 
-  const response = await fetch(`${webhookBase}/messages/${messageId}`);
+  const response = await fetch(
+    `${webhookBase}/messages/${messageId}`
+  );
 
   if (response.status === 404) return null;
 
@@ -138,6 +143,21 @@ function previousPlayers(existingMessage) {
   const match = value.match(/(\d+)\s*\/\s*(\d+)/);
 
   return match ? Number(match[1]) : null;
+}
+
+function previousStatus(existingMessage) {
+  const embed = existingMessage?.embeds?.[0];
+
+  const value =
+    getField(embed, "📡 Status") ??
+    getField(embed, "Último status conhecido");
+
+  if (!value) return null;
+
+  if (/\bONLINE\b/i.test(value)) return "ONLINE";
+  if (/\bOFFLINE\b/i.test(value)) return "OFFLINE";
+
+  return null;
 }
 
 async function fetchServerData() {
@@ -225,12 +245,11 @@ async function fetchServerData() {
         ? null
         : Number(playerPercentage),
 
-    map:
-      normalizeMap(
-        s.map ??
-        s.map_name ??
-        null
-      ),
+    map: normalizeMap(
+      s.map ??
+      s.map_name ??
+      null
+    ),
 
     ping:
       s.ping == null
@@ -250,12 +269,11 @@ async function fetchServerData() {
       s.mode ??
       null,
 
-    platform:
-      normalizePlatform(
-        s.platform ??
-        s.platforms ??
-        null
-      ),
+    platform: normalizePlatform(
+      s.platform ??
+      s.platforms ??
+      null
+    ),
 
     isOfficial:
       s.is_official ?? null,
@@ -477,6 +495,86 @@ function buildPayload(data, existingMessage) {
   };
 }
 
+function buildStatusChangePayload(data, oldStatus) {
+  const online = data.status === "ONLINE";
+
+  const emoji =
+    online
+      ? "🟢"
+      : "🔴";
+
+  const oldEmoji =
+    oldStatus === "ONLINE"
+      ? "🟢"
+      : "🔴";
+
+  const color =
+    online
+      ? 0x2ecc71
+      : 0xe74c3c;
+
+  const fields = [
+    {
+      name: "Mudança detectada",
+      value:
+        `${oldEmoji} **${oldStatus}** → ` +
+        `${emoji} **${data.status}**`,
+      inline: false
+    }
+  ];
+
+  if (
+    online &&
+    data.players != null &&
+    data.maxPlayers != null
+  ) {
+    fields.push({
+      name: "👥 Jogadores",
+      value: `**${data.players} / ${data.maxPlayers}**`,
+      inline: true
+    });
+  }
+
+  if (
+    online &&
+    data.ping != null
+  ) {
+    fields.push({
+      name: "📶 Ping",
+      value: `**${data.ping} ms**`,
+      inline: true
+    });
+  }
+
+  return {
+    username: "ARK Server Alertas",
+    embeds: [
+      {
+        title:
+          online
+            ? `🟢 ${data.name} voltou ONLINE`
+            : `🔴 ${data.name} ficou OFFLINE`,
+
+        url: SERVER.details,
+
+        description:
+          online
+            ? "O servidor voltou a responder como **ONLINE** no ARKStatus."
+            : "O ARKStatus passou a reportar o servidor como **OFFLINE**.",
+
+        color,
+        fields,
+
+        footer: {
+          text: "Alerta automático de mudança de estado"
+        },
+
+        timestamp: new Date().toISOString()
+      }
+    ]
+  };
+}
+
 function buildErrorPayload(error, existingMessage) {
   const oldEmbed = existingMessage?.embeds?.[0];
 
@@ -495,6 +593,7 @@ function buildErrorPayload(error, existingMessage) {
             name: "Último status conhecido",
             value:
               getField(oldEmbed, "📡 Status") ??
+              getField(oldEmbed, "Último status conhecido") ??
               "Ainda não há status anterior."
           },
           {
@@ -514,6 +613,7 @@ function buildErrorPayload(error, existingMessage) {
 
 async function sendNewMessage(payload) {
   const url = new URL(WEBHOOK);
+
   url.searchParams.set("wait", "true");
 
   const response = await fetch(url, {
@@ -531,6 +631,22 @@ async function sendNewMessage(payload) {
   }
 
   return response.json();
+}
+
+async function sendNotification(payload) {
+  const response = await fetch(WEBHOOK, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `Discord respondeu HTTP ${response.status} ao enviar alerta: ${await response.text()}`
+    );
+  }
 }
 
 async function editMessage(messageId, payload) {
@@ -574,15 +690,21 @@ async function main() {
       await getExistingMessage(messageId);
   }
 
+  const oldStatus =
+    previousStatus(existingMessage);
+
   let payload;
+  let data = null;
 
   try {
-    const data = await fetchServerData();
+    data = await fetchServerData();
 
     console.log("ARKStatus API OK");
+
     console.log(
       JSON.stringify(
         {
+          previousStatus: oldStatus,
           status: data.status,
           players: data.players,
           maxPlayers: data.maxPlayers,
@@ -605,38 +727,80 @@ async function main() {
       )
     );
 
-    payload = buildPayload(data, existingMessage);
+    payload =
+      buildPayload(data, existingMessage);
+
   } catch (error) {
-    console.error("Falha ARKStatus API:", error);
+    console.error(
+      "Falha ARKStatus API:",
+      error
+    );
 
     payload =
-      buildErrorPayload(error, existingMessage);
+      buildErrorPayload(
+        error,
+        existingMessage
+      );
   }
+
+  let panelUpdated = false;
 
   if (messageId && existingMessage) {
     const updated =
-      await editMessage(messageId, payload);
+      await editMessage(
+        messageId,
+        payload
+      );
 
     if (updated) {
+      panelUpdated = true;
+
       console.log(
         `Mensagem atualizada: ${messageId}`
       );
-      return;
     }
   }
 
-  const created =
-    await sendNewMessage(payload);
+  if (!panelUpdated) {
+    const created =
+      await sendNewMessage(payload);
 
-  fs.writeFileSync(
-    MESSAGE_ID_FILE,
-    `${created.id}\n`,
-    "utf8"
-  );
+    fs.writeFileSync(
+      MESSAGE_ID_FILE,
+      `${created.id}\n`,
+      "utf8"
+    );
 
-  console.log(
-    `Nova mensagem criada: ${created.id}`
-  );
+    console.log(
+      `Nova mensagem criada: ${created.id}`
+    );
+  }
+
+  const statusChanged =
+    data &&
+    (oldStatus === "ONLINE" ||
+     oldStatus === "OFFLINE") &&
+    (data.status === "ONLINE" ||
+     data.status === "OFFLINE") &&
+    oldStatus !== data.status;
+
+  if (statusChanged) {
+    await sendNotification(
+      buildStatusChangePayload(
+        data,
+        oldStatus
+      )
+    );
+
+    console.log(
+      `Alerta enviado: ${oldStatus} -> ${data.status}`
+    );
+
+  } else if (data) {
+    console.log(
+      "Sem mudança de status; nenhum alerta separado enviado."
+    );
+  }
 }
 
 main().catch(error => {
